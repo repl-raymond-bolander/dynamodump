@@ -14,6 +14,8 @@ install:
   - pip install flake8
 script:
   - flake8 --ignore=E501
+  - cp test/unit.py .
+  - python -m unittest unit
   - mkdir dump && cp -a test/testTable dump
   # test basic restore and backup
   - python dynamodump.py -m restore -r local -s testTable -d testRestoredTable --host localhost --port 8000 --accessKey a --secretKey a
