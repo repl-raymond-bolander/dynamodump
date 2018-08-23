@@ -60,6 +60,8 @@ MAX_NUMBER_BACKUP_WORKERS = 25
 METADATA_URL = "http://169.254.169.254/latest/meta-data/"
 
 
+
+
 def _get_aws_client(profile, region, service):
     """
     Build connection to some AWS service.
@@ -336,17 +338,17 @@ def get_restore_table_matches(table_name_wildcard, separator):
                          % dump_data_path)
             sys.exit(1)
 
+    logging.debug("dir list: " + ', '.join(dir_list))
     for dir_name in dir_list:
         if table_name_wildcard == "*":
             matching_tables.append(dir_name)
         elif separator == "":
-
             if dir_name.startswith(re.sub(r"([A-Z])", r" \1", table_name_wildcard.split("*", 1)[0])
                                    .split()[0]):
                 matching_tables.append(dir_name)
         elif dir_name.split(separator, 1)[0] == table_name_wildcard.split("*", 1)[0]:
             matching_tables.append(dir_name)
-
+    logging.debug("matching tables are: " + ', '.join(matching_tables))
     return matching_tables
 
 
@@ -473,23 +475,39 @@ def update_provisioned_throughput(conn, table_name, read_capacity, write_capacit
     """
     Update provisioned throughput on the table to provided values
     """
+    RETRY_START = 1.0
+    RETRY_MAX = 30.0
+    RETRY_FACTOR = 2.0
+    RETRY_TIME = None
 
     logging.info("Updating " + table_name + " table read capacity to: " +
                  str(read_capacity) + ", write capacity to: " + str(write_capacity))
-    while True:
+    now = time.time()
+    if RETRY_TIME is None:
+        attempt = 1
+    else:
+        attempt = (now >= RETRY_TIME)
+    if attempt:
         try:
             conn.update_table(table_name,
                               {"ReadCapacityUnits": int(read_capacity),
                                "WriteCapacityUnits": int(write_capacity)})
-            break
+            RETRY_TIME = None
         except boto.exception.JSONResponseError as e:
             if e.body["__type"] == "com.amazonaws.dynamodb.v20120810#LimitExceededException":
-                logging.info("Limit exceeded, retrying updating throughput of " + table_name + "..")
-                time.sleep(sleep_interval)
+                logging.info("Limit Exceeded: Throughput Update of " + table_name + ". Will retry after backoff period...")
             elif e.body["__type"] == "com.amazon.coral.availability#ThrottlingException":
-                logging.info("Control plane limit exceeded, retrying updating throughput"
-                             "of " + table_name + "..")
-                time.sleep(sleep_interval)
+                logging.info("Limit Exceeded: Control plane of " + table_name +  ".  Will retry after backoff period...")
+            elif e.body["message"] == "The requested throughput value equals the current value":
+                logging.info("Throughput limit already correctly set, no action is needed.")
+                pass
+            if RETRY_TIME is None:
+                RETRY_PERIOD = RETRY_START
+            else:
+                RETRY_PERIOD = RETRY_PERIOD * RETRY_FACTOR
+                if RETRY_PERIOD > RETRY_MAX:
+                    RETRY_PERIOD = RETRY_MAX
+            RETRY_TIME = now + RETRY_PERIOD
 
     # wait for provisioned throughput update completion
     if wait:
@@ -619,7 +637,7 @@ def do_backup(dynamo, read_capacity, read_capacity_ratio, tableQueue=None, srcTa
                                                   read_capacity, original_write_capacity)
 
                 # calculate backup read capacity
-                backup_read_capacity = read_capacity * float(read_capacity_ratio)
+                backup_read_capacity = float(read_capacity) * float(read_capacity_ratio)
 
                 # calculate limit
                 limit = calculate_limit(table_desc, backup_read_capacity)
@@ -880,6 +898,8 @@ def main():
                         "[required only for local]")
     parser.add_argument("--secretKey", help="Secret key of local DynamoDB "
                         "[required only for local]")
+    parser.add_argument("--token", help="Token for access "
+                            "[required for token sessions]")
     parser.add_argument("-p", "--profile",
                         help="AWS credentials file profile to use. Allows you to use a "
                         "profile instead accessKey, secretKey authentication")
@@ -943,12 +963,11 @@ def main():
                                                         is_secure=False)
         sleep_interval = LOCAL_SLEEP_INTERVAL
     else:
-        if not args.profile:
-            conn = boto.dynamodb2.connect_to_region(args.region, aws_access_key_id=args.accessKey,
-                                                    aws_secret_access_key=args.secretKey)
+        if not args.profile and not args.token:
+            conn = boto.dynamodb2.connect_to_region(args.region)
             sleep_interval = AWS_SLEEP_INTERVAL
         else:
-            conn = boto.dynamodb2.connect_to_region(args.region, profile_name=args.profile)
+            conn = boto.dynamodb2.connect_to_region(args.region, security_token=args.token)
             sleep_interval = AWS_SLEEP_INTERVAL
 
     # don't proceed if connection is not established
@@ -985,9 +1004,9 @@ def main():
 
         try:
             if args.srcTable.find("*") == -1:
-                do_backup(conn, args.read_capacity, args.readCapacityRatio, tableQueue=None)
+                do_backup(conn, float(args.read_capacity), float(args.readCapacityRatio), tableQueue=None)
             else:
-                do_backup(conn, args.read_capacity, args.readCapacityRatio, matching_backup_tables)
+                do_backup(conn, float(args.read_capacity), float(args.readCapacityRatio), matching_backup_tables)
         except AttributeError:
             # Didn't specify srcTable if we get here
 
@@ -995,8 +1014,8 @@ def main():
             threads = []
 
             for i in range(MAX_NUMBER_BACKUP_WORKERS):
-                t = threading.Thread(target=do_backup, args=(conn, args.readCapacity,
-                                                             args.readCapacityRatio),
+                t = threading.Thread(target=do_backup, args=(conn, float(args.readCapacity),
+                                                             float(args.readCapacityRatio)),
                                      kwargs={"tableQueue": q})
                 t.start()
                 threads.append(t)
